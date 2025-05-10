@@ -64,91 +64,107 @@ def calibrate_skin_tone(hsv_img, roi):
 
 # Function to find boundary points (simplified contour detection)
 def find_boundary_points(mask):
-    # Find boundary by taking the difference between dilated and eroded mask
     dilated = binary_dilation(mask > 0, iterations=1)
     eroded = binary_erosion(mask > 0, iterations=1)
     boundary = (dilated & ~eroded).astype(np.uint8)
     points = np.where(boundary)
     return list(zip(points[0], points[1]))
 
-# Function to compute a simplified convex hull
+# Function to compute a convex hull (improved)
 def compute_convex_hull(points):
     if len(points) < 3:
         return points
 
-    # Sort points by x-coordinate, then by y-coordinate
-    points = sorted(points, key=lambda p: (p[1], p[0]))
+    # Start with the lowest point (or leftmost if tied)
+    points = sorted(points, key=lambda p: (p[0], p[1]))
+    start = points[0]
     
-    # Simplified convex hull: take topmost, bottommost, leftmost, rightmost points
-    hull = []
-    hull.append(min(points, key=lambda p: p[0]))  # Leftmost
-    hull.append(max(points, key=lambda p: p[0]))  # Rightmost
-    hull.append(min(points, key=lambda p: p[1]))  # Topmost
-    hull.append(max(points, key=lambda p: p[1]))  # Bottommost
+    # Sort points by polar angle with respect to the start point
+    def polar_angle(p):
+        x, y = p[1] - start[1], p[0] - start[0]
+        return np.arctan2(y, x)
     
-    # Remove duplicates and sort by angle from centroid
-    hull = list(set(hull))
-    if len(hull) < 3:
-        return hull
+    points = sorted(points[1:], key=polar_angle)
+    points = [start] + points
     
-    centroid = np.mean(hull, axis=0)
-    hull = sorted(hull, key=lambda p: np.arctan2(p[0] - centroid[0], p[1] - centroid[1]))
+    # Graham scan algorithm for convex hull
+    hull = [points[0], points[1]]
+    for p in points[2:]:
+        while len(hull) > 1:
+            # Check if the last three points make a right turn
+            p1, p2 = hull[-2], hull[-1]
+            if ((p2[1] - p1[1]) * (p[0] - p1[0]) - (p2[0] - p1[0]) * (p[1] - p1[1])) >= 0:
+                hull.pop()
+            else:
+                break
+        hull.append(p)
+    
     return hull
 
-# Function to find defects (gaps between fingers)
+# Function to find defects (improved)
 def find_defects(contour_points, hull_points):
     if len(contour_points) < 3 or len(hull_points) < 3:
         return []
 
     defects = []
-    hull_set = set(hull_points)
+    hull_indices = []
     contour_array = np.array(contour_points)
     
-    # For each segment of the contour, check for significant deviations from the hull
-    for i in range(len(contour_points)):
-        start = contour_points[i]
-        end = contour_points[(i + 1) % len(contour_points)]
-        if start in hull_set and end in hull_set:
+    # Map hull points to their indices in the contour
+    for hp in hull_points:
+        distances = np.linalg.norm(contour_array - np.array(hp), axis=1)
+        idx = np.argmin(distances)
+        hull_indices.append(idx)
+    
+    hull_indices.sort()
+    
+    # For each segment between consecutive hull points, find the farthest point
+    for i in range(len(hull_indices)):
+        start_idx = hull_indices[i]
+        end_idx = hull_indices[(i + 1) % len(hull_indices)]
+        
+        if end_idx <= start_idx:
+            end_idx += len(contour_points)
+        
+        segment_indices = list(range(start_idx, end_idx))
+        segment_indices = [idx % len(contour_points) for idx in segment_indices]
+        if not segment_indices:
             continue
         
-        # Find the farthest point between start and end
-        segment_points = contour_array[(contour_array[:, 0] >= min(start[0], end[0])) & 
-                                       (contour_array[:, 0] <= max(start[0], end[0])) & 
-                                       (contour_array[:, 1] >= min(start[1], end[1])) & 
-                                       (contour_array[:, 1] <= max(start[1], end[1]))]
-        if len(segment_points) < 3:
-            continue
+        segment_points = contour_array[segment_indices]
+        start_point = contour_array[start_idx]
+        end_point = contour_array[end_idx % len(contour_points)]
         
         # Compute distance from the line connecting start and end
-        line_vec = np.array(end) - np.array(start)
+        line_vec = end_point - start_point
         line_len = np.linalg.norm(line_vec)
-        if line_len == 0:
+        if line_len < 1:
             continue
         
         line_unit = line_vec / line_len
-        points_vec = segment_points - np.array(start)
+        points_vec = segment_points - start_point
         dists = np.abs(np.cross(line_unit, points_vec))
         far_idx = np.argmax(dists)
-        far_point = tuple(segment_points[far_idx])
+        far_point = segment_points[far_idx]
         depth = dists[far_idx]
         
         # Compute angle at the far point
-        a = np.linalg.norm(np.array(end) - np.array(start))
-        b = np.linalg.norm(np.array(far_point) - np.array(start))
-        c = np.linalg.norm(np.array(end) - np.array(far_point))
+        a = np.linalg.norm(end_point - start_point)
+        b = np.linalg.norm(far_point - start_point)
+        c = np.linalg.norm(end_point - far_point)
         if a == 0 or b == 0 or c == 0:
             continue
         angle = np.arccos((b**2 + c**2 - a**2) / (2 * b * c)) * 57.2958
         
-        # Filter defects similar to OpenCV code
-        if angle < 100 and depth > 20:  # Adjusted depth threshold for sensitivity
-            defects.append((start, end, far_point, depth))
+        # Adjusted criteria to detect more defects
+        if angle < 90 and depth > 10:  # Lowered depth threshold for sensitivity
+            defects.append((tuple(start_point), tuple(end_point), tuple(far_point), depth))
     
     return defects
 
 # Function to estimate finger count
 def estimate_finger_count(mask):
-    # Clean the mask (similar to OpenCV preprocessing)
+    # Clean the mask
     mask = binary_erosion(mask > 0, iterations=1).astype(np.uint8) * 255
     mask = binary_dilation(mask, iterations=2).astype(np.uint8) * 255
     mask = (gaussian_filter(mask.astype(float), sigma=2.5) > 128).astype(np.uint8) * 255
@@ -158,12 +174,12 @@ def estimate_finger_count(mask):
     if num_features == 0:
         return 0
 
-    # Find the largest component (similar to max contour in OpenCV)
+    # Find the largest component
     component_sizes = [(i, np.sum(labeled_array == i)) for i in range(1, num_features + 1)]
     largest_component = max(component_sizes, key=lambda x: x[1])[0]
     component_mask = (labeled_array == largest_component).astype(np.uint8) * 255
 
-    # Check if the component is large enough (similar to contourArea > 2000)
+    # Check if the component is large enough
     if np.sum(component_mask) < 2000:
         return 0
 
@@ -182,7 +198,17 @@ def estimate_finger_count(mask):
 
     # Count fingers based on defects
     finger_count = len(defects)
-    finger_count = min(finger_count + 1, 5)  # Add 1 to account for the last finger, cap at 5
+    finger_count = min(finger_count + 1, 5)  # Add 1 for the last finger, cap at 5
+
+    # Fallback heuristic: count vertical protrusions if defects are insufficient
+    if finger_count < 2:
+        # Project the mask vertically and count peaks
+        vertical_projection = np.sum(mask > 0, axis=0)
+        threshold = 0.3 * np.max(vertical_projection)
+        peaks = (vertical_projection > threshold).astype(int)
+        transitions = np.diff(peaks)
+        finger_count = np.count_nonzero(transitions == 1)
+        finger_count = min(finger_count, 5)
 
     return finger_count
 
