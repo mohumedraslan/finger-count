@@ -2,9 +2,20 @@ import streamlit as st
 from PIL import Image
 import numpy as np
 
+# Streamlit page configuration
 st.title("Finger Count Recognition (No OpenCV)")
+st.write("Upload an image of a hand to count fingers. Optionally calibrate skin tone for better detection.")
+
+# File uploader for image input
 uploaded_file = st.file_uploader("Upload an image of a hand", type=["jpg", "jpeg", "png"])
 
+# Initialize session state for calibration
+if 'calibrated' not in st.session_state:
+    st.session_state.calibrated = False
+    st.session_state.lower_skin = np.array([0, 40, 60], dtype=np.uint8)
+    st.session_state.upper_skin = np.array([20, 255, 255], dtype=np.uint8)
+
+# Function to convert RGB to HSV (unchanged)
 def rgb_to_hsv(image):
     image = image / 255.0
     r, g, b = image[..., 0], image[..., 1], image[..., 2]
@@ -27,9 +38,10 @@ def rgb_to_hsv(image):
     h = np.where(h < 0, h + 1, h)
     return np.stack([h * 179, s * 255, v * 255], axis=-1).astype(np.uint8)
 
+# Function to create skin mask (modified to use session state)
 def create_skin_mask(hsv_img):
-    lower_skin = np.array([0, 40, 60])
-    upper_skin = np.array([20, 255, 255])
+    lower_skin = st.session_state.lower_skin
+    upper_skin = st.session_state.upper_skin
     mask = np.all([
         hsv_img[..., 0] >= lower_skin[0],
         hsv_img[..., 0] <= upper_skin[0],
@@ -40,23 +52,60 @@ def create_skin_mask(hsv_img):
     ], axis=0)
     return mask.astype(np.uint8) * 255
 
+# Function to calibrate skin tone
+def calibrate_skin_tone(hsv_img, roi):
+    # Extract central region of ROI
+    center_y, center_x = roi.shape[0] // 2, roi.shape[1] // 2
+    sample = hsv_img[center_y-10:center_y+10, center_x-10:center_x+10]
+    h, s, v = np.median(sample, axis=(0, 1)).astype(np.uint8)
+    lower_skin = np.array([max(0, h-10), max(40, s-40), max(60, v-40)], dtype=np.uint8)
+    upper_skin = np.array([min(179, h+10), 255, 255], dtype=np.uint8)
+    return lower_skin, upper_skin
+
+# Function to estimate finger count (unchanged)
 def estimate_finger_count(mask):
-    """Very naive estimation: count vertical transitions from background to foreground."""
-    vertical_projection = np.sum(mask, axis=1)  # Sum across rows
+    vertical_projection = np.sum(mask, axis=1)
     threshold = 0.3 * np.max(vertical_projection)
     active_rows = vertical_projection > threshold
     transitions = np.diff(active_rows.astype(int))
     finger_count = np.count_nonzero(transitions == 1)
     return min(finger_count, 5)
 
+# Process the uploaded image
 if uploaded_file:
+    # Read and convert image
     image = Image.open(uploaded_file).convert("RGB")
     np_image = np.array(image)
+    
+    # Define ROI for calibration (same proportions as previous code)
+    height, width = np_image.shape[:2]
+    roi_top, roi_bottom = int(height * 0.1), int(height * 0.6)
+    roi_left, roi_right = int(width * 0.3), int(width * 0.7)
+    roi = np_image[roi_top:roi_bottom, roi_left:roi_right]
+    
+    # Convert to HSV
     hsv_image = rgb_to_hsv(np_image)
+    hsv_roi = hsv_image[roi_top:roi_bottom, roi_left:roi_right]
+    
+    # Calibration button
+    if not st.session_state.calibrated:
+        st.write("Press the button to calibrate skin tone based on the ROI.")
+        if st.button("Calibrate"):
+            st.session_state.lower_skin, st.session_state.upper_skin = calibrate_skin_tone(hsv_image, hsv_roi)
+            st.session_state.calibrated = True
+            st.write(f"Calibrated HSV range: {st.session_state.lower_skin} to {st.session_state.upper_skin}")
+    
+    # Create skin mask
     mask = create_skin_mask(hsv_image)
-
+    
+    # Estimate finger count
     finger_count = estimate_finger_count(mask)
-
-    st.image(image, caption="Uploaded Image", use_column_width=True)
+    
+    # Draw ROI rectangle on the image
+    np_image_with_roi = np_image.copy()
+    cv2.rectangle(np_image_with_roi, (roi_left, roi_top), (roi_right, roi_bottom), (0, 255, 0), 2)
+    
+    # Display results
+    st.image(np_image_with_roi, caption="Uploaded Image with ROI", use_column_width=True)
     st.image(mask, caption="Skin Mask", clamp=True, channels="GRAY")
     st.success(f"Estimated Fingers: {finger_count}")
