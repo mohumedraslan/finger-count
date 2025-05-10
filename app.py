@@ -1,6 +1,7 @@
 import streamlit as st
 from PIL import Image, ImageDraw
 import numpy as np
+from scipy.ndimage import label
 
 # Streamlit page configuration
 st.title("Finger Count Recognition (No OpenCV)")
@@ -61,13 +62,32 @@ def calibrate_skin_tone(hsv_img, roi):
     upper_skin = np.array([min(179, h+10), 255, 255], dtype=np.uint8)
     return lower_skin, upper_skin
 
-# Function to estimate finger count (unchanged)
+# Function to estimate finger count using connected components
 def estimate_finger_count(mask):
-    vertical_projection = np.sum(mask, axis=1)
-    threshold = 0.3 * np.max(vertical_projection)
-    active_rows = vertical_projection > threshold
-    transitions = np.diff(active_rows.astype(int))
-    finger_count = np.count_nonzero(transitions == 1)
+    # Label connected components
+    labeled_array, num_features = label(mask > 0)
+    if num_features <= 1:  # No or single region
+        return 0
+
+    # Analyze each component
+    finger_count = 0
+    for i in range(1, num_features + 1):
+        component = (labeled_array == i).astype(np.uint8)
+        # Calculate bounding box and aspect ratio
+        rows = np.any(component, axis=1)
+        cols = np.any(component, axis=0)
+        if not np.any(rows) or not np.any(cols):
+            continue
+        rmin, rmax = np.where(rows)[0][[0, -1]]
+        cmin, cmax = np.where(cols)[0][[0, -1]]
+        height = rmax - rmin
+        width = cmax - cmin
+        aspect_ratio = height / width if width > 0 else 0
+
+        # Simple heuristic: count components with aspect ratio > 1 (vertical) as fingers
+        if height > 20 and aspect_ratio > 1 and np.sum(component) > 500:  # Min size and shape filter
+            finger_count += 1
+
     return min(finger_count, 5)
 
 # Process the uploaded image
